@@ -1,11 +1,21 @@
 import json
 import logging
 import os
-
 import requests
 
-
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# Custom Exceptions
+# ============================================================
+
+class GroqAPIError(Exception):
+    """Raised when an external API or network error occurs."""
+    pass
+
+class InvalidLLMResponseError(Exception):
+    """Raised when the model output is missing, malformed, or truncated."""
+    pass
 
 # ============================================================
 # Configuration
@@ -13,22 +23,21 @@ logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# Default to a standard, active Groq model
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
 )
 
-GROQ_API_URL = (
-    "https://api.groq.com/openai/v1/chat/completions"
-)
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 60
 
-# Retry once with a larger output budget if the model truncates.
+# Retry once with a larger output budget if truncated
 OUTPUT_TOKEN_LIMITS = (4096, 6144)
 
-system_prompt ="""You are Cortex AI, an intelligent conversational assistant developed by web developer Varma.
+SYSTEM_PROMPT = """You are Cortex AI, an intelligent conversational assistant developed by web developer Varma.
 
 Behavior rules:
 - When the user greets you (hello, hi, hey, good morning, etc.), introduce yourself clearly as "Cortex AI developed by Varma" before continuing the conversation.
@@ -44,35 +53,39 @@ Identity:
 - Creator: Varma (Web Developer)
 - Purpose: Assist with programming, web development, and general knowledge tasks efficiently."""
 
+# ============================================================
+# Validation Helpers
+# ============================================================
+
 def validate_messages(messages):
     """Validate the messages supplied by the Django view."""
-
     if not isinstance(messages, list) or not messages:
-        raise ValueError(
-            "messages must be a non-empty list."
-        )
+        raise ValueError("messages must be a non-empty list.")
 
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
-            raise ValueError(
-                f"Message {index} must be a dictionary."
-            )
+            raise ValueError(f"Message {index} must be a dictionary.")
 
         if message.get("role") not in {"user", "assistant"}:
-            raise ValueError(
-                f"Message {index} has an unsupported role."
-            )
+            raise ValueError(f"Message {index} has an unsupported role.")
 
-        if not isinstance(message.get("content"), str):
-            raise ValueError(
-                f"Message {index} content must be a string."
-            )
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError(f"Message {index} content must be a string.")
 
-        if not message["content"].strip():
-            raise ValueError(
-                f"Message {index} content cannot be empty."
-            )
+        if not content.strip():
+            raise ValueError(f"Message {index} content cannot be empty.")
 
+def validate_analysis(content):
+    """
+    Validate and extract response data.
+    If the response is structured JSON, parse and return the dict;
+    otherwise, return a standard text payload.
+    """
+    try:
+        return json.loads(content)
+    except (ValueError, TypeError):
+        return {"response": content}
 
 # ============================================================
 # Groq API Request
@@ -80,7 +93,6 @@ def validate_messages(messages):
 
 def _request_groq(messages, max_tokens):
     """Make one request to the Groq chat-completions endpoint."""
-
     payload = {
         "model": GROQ_MODEL,
         "messages": [
@@ -90,9 +102,6 @@ def _request_groq(messages, max_tokens):
             },
             *messages,
         ],
-        "response_format": {
-            "type": "json_object",
-        },
         "temperature": 0.2,
         "max_completion_tokens": max_tokens,
     }
@@ -109,20 +118,12 @@ def _request_groq(messages, max_tokens):
             json=payload,
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
         )
-
     except requests.exceptions.Timeout as exc:
         logger.warning("Groq request timed out.")
-
-        raise GroqAPIError(
-            "The AI service timed out. Please try again."
-        ) from exc
-
+        raise GroqAPIError("The AI service timed out. Please try again.") from exc
     except requests.exceptions.RequestException as exc:
         logger.exception("Could not connect to Groq.")
-
-        raise GroqAPIError(
-            "Unable to connect to the AI service."
-        ) from exc
+        raise GroqAPIError("Unable to connect to the AI service.") from exc
 
     try:
         data = response.json()
@@ -131,24 +132,15 @@ def _request_groq(messages, max_tokens):
             "Groq returned a non-JSON response. HTTP status: %s",
             response.status_code,
         )
-
-        raise GroqAPIError(
-            "The AI provider returned an invalid response."
-        ) from exc
+        raise GroqAPIError("The AI provider returned an invalid response.") from exc
 
     if not isinstance(data, dict):
-        raise GroqAPIError(
-            "The AI provider returned an unexpected response."
-        )
+        raise GroqAPIError("The AI provider returned an unexpected response structure.")
 
     if not response.ok or "error" in data:
         error = data.get("error", {})
-
         if isinstance(error, dict):
-            error_message = error.get(
-                "message",
-                "Unknown provider error.",
-            )
+            error_message = error.get("message", "Unknown provider error.")
             error_code = error.get("code")
         else:
             error_message = str(error)
@@ -162,49 +154,27 @@ def _request_groq(messages, max_tokens):
         )
 
         if response.status_code == 401:
-            raise GroqAPIError(
-                "AI authentication failed. Check GROQ_API_KEY."
-            )
-
+            raise GroqAPIError("AI authentication failed. Check GROQ_API_KEY.")
         if response.status_code == 403:
-            raise GroqAPIError(
-                "Your account does not have access to this model."
-            )
-
+            raise GroqAPIError("Your account does not have access to this model.")
         if response.status_code == 404:
             raise GroqAPIError(
-                "The configured Groq model is unavailable. "
-                "Check GROQ_MODEL against the models accessible "
-                "to your API key."
+                f"The model '{GROQ_MODEL}' is unavailable. Check GROQ_MODEL setting."
             )
-
         if response.status_code == 429:
-            raise GroqAPIError(
-                "The AI service rate limit or usage limit was reached."
-            )
-
+            raise GroqAPIError("The AI service rate limit or usage limit was reached.")
         if response.status_code >= 500:
-            raise GroqAPIError(
-                "The AI provider is temporarily unavailable."
-            )
+            raise GroqAPIError("The AI provider is temporarily unavailable.")
 
-        raise GroqAPIError(
-            f"The AI request failed with HTTP {response.status_code}."
-        )
+        raise GroqAPIError(f"The AI request failed with HTTP {response.status_code}.")
 
     choices = data.get("choices")
-
     if not isinstance(choices, list) or not choices:
-        raise InvalidLLMResponseError(
-            "Groq returned no completion choices."
-        )
+        raise InvalidLLMResponseError("Groq returned no completion choices.")
 
     choice = choices[0]
-
     if not isinstance(choice, dict):
-        raise InvalidLLMResponseError(
-            "Groq returned a malformed completion."
-        )
+        raise InvalidLLMResponseError("Groq returned a malformed completion choice.")
 
     finish_reason = choice.get("finish_reason")
     usage = data.get("usage", {})
@@ -220,22 +190,15 @@ def _request_groq(messages, max_tokens):
     content = message.get("content")
 
     if finish_reason == "length":
-        raise InvalidLLMResponseError(
-            "TRUNCATED: The model reached its output-token limit."
-        )
+        raise InvalidLLMResponseError("TRUNCATED: The model reached its output-token limit.")
 
     if finish_reason not in {"stop", None}:
-        raise InvalidLLMResponseError(
-            f"The model ended unexpectedly: {finish_reason}."
-        )
+        raise InvalidLLMResponseError(f"The model ended unexpectedly: {finish_reason}.")
 
     if not isinstance(content, str) or not content.strip():
-        raise InvalidLLMResponseError(
-            "Groq returned empty analysis content."
-        )
+        raise InvalidLLMResponseError("Groq returned empty response content.")
 
     return content.strip()
-
 
 # ============================================================
 # Public Function
@@ -243,37 +206,25 @@ def _request_groq(messages, max_tokens):
 
 def ask_llm(messages):
     """
-    Analyze a resume against a job description.
+    Execute chat completion with dynamic token fallback.
 
     Args:
-        messages: Chat messages prepared by the Django view.
+        messages: List of chat message dictionaries.
 
     Returns:
-        A validated JSON string.
-
-    Raises:
-        GroqAPIError: When the API request fails.
-        InvalidLLMResponseError: When the model output is invalid.
+        JSON-encoded string containing the response.
     """
-
     if not GROQ_API_KEY:
-        raise GroqAPIError(
-            "GROQ_API_KEY environment variable is not configured."
-        )
+        raise GroqAPIError("GROQ_API_KEY environment variable is not configured.")
 
     if not GROQ_MODEL:
-        raise GroqAPIError(
-            "GROQ_MODEL environment variable is empty."
-        )
+        raise GroqAPIError("GROQ_MODEL environment variable is empty.")
 
     validate_messages(messages)
 
     last_error = None
 
-    for attempt, token_limit in enumerate(
-        OUTPUT_TOKEN_LIMITS,
-        start=1,
-    ):
+    for attempt, token_limit in enumerate(OUTPUT_TOKEN_LIMITS, start=1):
         try:
             content = _request_groq(
                 messages=messages,
@@ -282,7 +233,6 @@ def ask_llm(messages):
 
             result = validate_analysis(content)
 
-            # Preserve the string return type expected by existing views.
             return json.dumps(
                 result,
                 ensure_ascii=False,
@@ -290,31 +240,26 @@ def ask_llm(messages):
 
         except InvalidLLMResponseError as exc:
             last_error = exc
-
             is_truncated = "TRUNCATED:" in str(exc)
 
             if is_truncated and attempt < len(OUTPUT_TOKEN_LIMITS):
                 logger.warning(
-                    "Output truncated. Retrying once with "
-                    "max_completion_tokens=%s.",
+                    "Output truncated. Retrying with max_completion_tokens=%s.",
                     OUTPUT_TOKEN_LIMITS[attempt],
                 )
                 continue
 
             logger.error(
-                "Invalid AI analysis on attempt %s: %s",
+                "Invalid AI response on attempt %s: %s",
                 attempt,
                 exc,
             )
 
             if is_truncated:
                 raise InvalidLLMResponseError(
-                    "The AI response remained incomplete after "
-                    "retrying. Try a shorter resume or job description."
+                    "The AI response remained incomplete after retrying."
                 ) from exc
 
             raise
 
-    raise InvalidLLMResponseError(
-        "Unable to produce a valid resume analysis."
-    ) from last_error
+    raise InvalidLLMResponseError("Unable to produce a valid response.") from last_error
